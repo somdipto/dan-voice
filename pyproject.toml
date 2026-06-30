@@ -34,7 +34,7 @@ dev = [
 ]
 
 [project.scripts]
-dan-voice = "voice_dani.main:app"
+dan-voice = "voice_dani.__main__:app"
 
 [build-system]
 requires = ["hatchling"]
