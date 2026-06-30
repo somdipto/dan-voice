@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import json
 import logging
 import os
@@ -169,23 +170,33 @@ def _start_tunnel(port: int) -> str | None:
     try:
         proc = subprocess.Popen(
             [cloudflared, "tunnel", "--url", f"http://127.0.0.1:{port}"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
         )
         deadline = time.time() + config.server.tunnel_timeout
+        url = None
+
         while time.time() < deadline:
-            line = proc.stderr.readline()
+            line = proc.stdout.readline()
             if not line:
-                # Process died
                 break
-            m = re.search(r"(https://[a-zA-Z0-9-]+\.trycloudflare\.com)", line)
+
+            # Extract URL with regex - handles all cloudflared output formats
+            m = re.search(r'(https://[a-zA-Z0-9-]+\.trycloudflare\.com)', line)
             if m:
+                url = m.group(1)
                 _tunnel_proc = proc  # Keep alive!
-                return m.group(1)
-        proc.kill()
-        return None
-    except Exception:
+                break
+
+        if url:
+            return url
+        else:
+            proc.kill()
+            return None
+
+    except Exception as e:
+        log.error(f"Tunnel error: {e}")
         return None
 
 
@@ -264,8 +275,25 @@ def run(
     """Start the server. Blocks on uvicorn."""
     import uvicorn
 
-    if startup_info is None:
-        startup_info = print_startup_box(host=host, port=port, tunnel=tunnel, agent=agent)
+    actual_port = _find_port(host, port)
+
+    # Print startup box (without tunnel URL yet)
+    pin = pairing_manager.create_pin()
+    tts_backend = _check_tts()
+    public_url = None
+
+    print()
+    print("  ┌─────────────────────────────────────────────┐")
+    print("  │             Voice Dani — ready               │")
+    print("  ├─────────────────────────────────────────────┤")
+    print(f"  │  Local URL:   http://{host}:{actual_port:<20} │")
+    print(f"  │  PIN:         {pin:<30} │")
+    print(f"  │  TTS:         {tts_backend:<30} │")
+    print("  ├─────────────────────────────────────────────┤")
+    print("  │  Starting server…                           │")
+    print("  └─────────────────────────────────────────────┘")
+    print()
+    sys.stdout.flush()
 
     # Set up signal handlers for graceful shutdown
     def signal_handler(sig, frame):
@@ -275,13 +303,58 @@ def run(
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    uvicorn.run(
-        app,
-        host=startup_info["host"],
-        port=startup_info["port"],
-        log_level=config.server.log_level,
-        ws="websockets",
+    # Configure uvicorn
+    cfg = uvicorn.Config(
+        app, host=host, port=actual_port,
+        log_level=config.server.log_level, ws="websockets",
     )
+
+    # Start server in a thread so we can start tunnel after it's listening
+    server_ready = threading.Event()
+    server_exc: list[Exception] = []
+
+    def _run():
+        try:
+            server = uvicorn.Server(cfg)
+            server_ready.set()
+            server.run()
+        except Exception as e:
+            server_exc.append(e)
+            server_ready.set()
+
+    server_thread = threading.Thread(target=_run, daemon=True)
+    server_thread.start()
+    server_ready.wait(timeout=15)
+    if server_exc:
+        raise server_exc[0]
+
+    # Now start tunnel — server IS listening
+    if tunnel:
+        public_url = _start_tunnel(actual_port)
+
+    # Update startup box with tunnel URL
+    print()
+    print("  ┌─────────────────────────────────────────────┐")
+    print("  │             Voice Dani — ready               │")
+    print("  ├─────────────────────────────────────────────┤")
+    if public_url:
+        print(f"  │  Public URL:  {public_url:<30s} │")
+    print(f"  │  Local URL:   http://{host}:{actual_port:<20} │")
+    print(f"  │  PIN:         {pin:<30} │")
+    print(f"  │  TTS:         {tts_backend:<30} │")
+    print("  ├─────────────────────────────────────────────┤")
+    if public_url:
+        print("  │  Open the URL on your phone, enter the PIN  │")
+        print("  │  to connect.                                │")
+    else:
+        print("  │  Open http://127.0.0.1:7860 on your phone,  │")
+        print("  │  enter the PIN to connect.                  │")
+    print("  └─────────────────────────────────────────────┘")
+    print()
+    sys.stdout.flush()
+
+    # Block until server thread exits
+    server_thread.join()
 
 
 if __name__ == "__main__":
