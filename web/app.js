@@ -238,7 +238,8 @@ connectBtn.addEventListener("click", async () => {
       token = redeemed.session_token;
       saveSession(token);
     }
-    await unlockAudio();
+    // Unlock audio without blocking UI
+    unlockAudio().catch(() => {});
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     ws = new WebSocket(`${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`);
     ws.binaryType = "arraybuffer";
@@ -347,11 +348,11 @@ textInput.addEventListener("keydown", (e) => {
 
 sendBtn.addEventListener("click", sendText);
 
-bargeBtn.addEventListener("click", async () => {
+bargeBtn.addEventListener("click", () => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "barge_in" }));
     stopRecordingNow();
-    await startRecording();
+    startRecording().catch(() => {});
     setOrbState(liveOrb, "listening");
     liveStatus.textContent = "Listening…";
     haptic("heavy");
