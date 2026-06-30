@@ -138,6 +138,13 @@ async def run_agent(prompt: str, agent: str = "opencode") -> Generator[str, None
                     yield text + " "
             except json.JSONDecodeError:
                 yield text + " "
+    except asyncio.CancelledError:
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            proc.kill()
+        raise
     finally:
         proc.wait()
 
