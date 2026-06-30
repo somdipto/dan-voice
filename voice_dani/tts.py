@@ -226,11 +226,11 @@ class SayTTS(TTSBackend):
             return b""
 
         try:
-            with tempfile.NamedTemporaryFile(suffix=".aiff", delete=False) as f:
-                aiff_path = f.name
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                wav_path = f.name
 
             proc = subprocess.run(
-                ["say", "-v", self._voice, "-o", aiff_path, text],
+                ["say", "-v", self._voice, "-o", wav_path, text],
                 capture_output=True,
                 timeout=15,
             )
@@ -238,25 +238,46 @@ class SayTTS(TTSBackend):
                 log.error(f"say failed: {proc.stderr.decode()}")
                 return b""
 
-            with open(aiff_path, "rb") as f:
-                aiff_data = f.read()
-            os.unlink(aiff_path)
-
-            # Parse AIFF-C: find SSND chunk, read exact PCM data
-            ssnd_pos = aiff_data.find(b"SSND")
-            if ssnd_pos >= 0 and ssnd_pos + 8 <= len(aiff_data):
-                chunk_size = int.from_bytes(aiff_data[ssnd_pos + 4 : ssnd_pos + 8], "big")
-                # SSND chunk: 4B offset + 4B block_size + PCM data
-                pcm_start = ssnd_pos + 16
-                pcm_end = ssnd_pos + 4 + 4 + chunk_size
-                return aiff_data[pcm_start:pcm_end]
-            # Fallback: try standard 44-byte AIFF header
-            if len(aiff_data) > 44:
-                return aiff_data[44:]
-            return b""
+            # Read WAV file and extract PCM16
+            return self._read_wav_pcm16(wav_path)
         except Exception as e:
             log.error(f"Say TTS error: {e}")
             return b""
+
+    @staticmethod
+    def _read_wav_pcm16(wav_path: str) -> bytes:
+        """Read a WAV file and return raw PCM16 bytes."""
+        with open(wav_path, "rb") as f:
+            data = f.read()
+
+        if len(data) < 44 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+            return data  # Not a valid WAV, return raw
+
+        num_channels = int.from_bytes(data[22:24], "little")
+        bits_per_sample = int.from_bytes(data[34:36], "little")
+        sample_rate = int.from_bytes(data[24:28], "little")
+
+        # Find data chunk
+        off = 12
+        pcm_data = b""
+        while off < len(data) - 8:
+            chunk_id = data[off : off + 4]
+            chunk_size = int.from_bytes(data[off + 4 : off + 8], "little")
+            if chunk_id == b"data":
+                pcm_data = data[off + 8 : off + 8 + chunk_size]
+                break
+            off += 8 + chunk_size
+
+        if not pcm_data:
+            return data[44:]
+
+        # Convert stereo to mono if needed
+        if num_channels == 2 and bits_per_sample == 16:
+            samples = np.frombuffer(pcm_data, dtype=np.int16)
+            mono = ((samples[0::2].astype(np.int32) + samples[1::2].astype(np.int32)) // 2).astype(np.int16)
+            return mono.tobytes()
+
+        return pcm_data
 
 
 def create_tts_backend() -> TTSBackend:

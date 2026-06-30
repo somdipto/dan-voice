@@ -177,6 +177,8 @@ async def handle_audio(ws: WebSocket, agent: str = "opencode"):
     """Handle audio WebSocket session."""
     await ws.send_json({"type": "state", "value": "idle"})
 
+    agent_task: asyncio.Task | None = None
+
     try:
         while True:
             msg = await ws.receive()
@@ -186,6 +188,14 @@ async def handle_audio(ws: WebSocket, agent: str = "opencode"):
                 try:
                     data = json.loads(msg["text"])
                     if data.get("type") == "barge_in":
+                        # Cancel any in-progress agent run
+                        if agent_task and not agent_task.done():
+                            agent_task.cancel()
+                            try:
+                                await agent_task
+                            except asyncio.CancelledError:
+                                pass
+                            agent_task = None
                         await ws.send_json({"type": "state", "value": "listening"})
                         continue
                 except json.JSONDecodeError:
@@ -212,10 +222,19 @@ async def handle_audio(ws: WebSocket, agent: str = "opencode"):
             await ws.send_json({"type": "transcript", "text": text})
             await ws.send_json({"type": "state", "value": "responding"})
 
-            # Run agent
+            # Run agent (track as task so we can cancel on barge-in)
             response_parts = []
-            async for token in run_agent(text, agent):
-                response_parts.append(token)
+            async def _run_and_collect():
+                nonlocal response_parts
+                async for token in run_agent(text, agent):
+                    response_parts.append(token)
+            agent_task = asyncio.create_task(_run_and_collect())
+            try:
+                await agent_task
+            except asyncio.CancelledError:
+                response_parts = []
+            finally:
+                agent_task = None
 
             response = "".join(response_parts)
             if not response.strip():
@@ -239,4 +258,6 @@ async def handle_audio(ws: WebSocket, agent: str = "opencode"):
     except Exception as e:
         log.error(f"Audio session error: {e}")
     finally:
+        if agent_task and not agent_task.done():
+            agent_task.cancel()
         await ws.send_json({"type": "state", "value": "idle"})

@@ -16,7 +16,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -45,6 +45,11 @@ async def lifespan(app: FastAPI):
     # Shutdown
     log.info("Voice Dani server shutting down...")
     cleanup_task.cancel()
+    # Kill cloudflared tunnel
+    global _tunnel_proc
+    if _tunnel_proc:
+        _tunnel_proc.kill()
+        _tunnel_proc = None
     # Close all active connections
     for ws in list(_active_connections):
         try:
@@ -97,9 +102,10 @@ async def pair_create():
 
 
 @app.post("/api/pair/redeem")
-async def pair_redeem(req: dict):
+async def pair_redeem(req: dict, request: Request):
     pin = req.get("pin", "")
-    client_ip = req.get("client_ip", "unknown")
+    # Use actual TCP connection IP — never trust client-supplied value
+    client_ip = request.client.host if request.client else "unknown"
     token = pairing_manager.redeem(pin, client_ip)
     if token is None:
         raise HTTPException(status_code=401, detail="Invalid or expired PIN")
@@ -150,22 +156,34 @@ if WEB_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
 
+_tunnel_proc: subprocess.Popen | None = None
+
+
 def _start_tunnel(port: int) -> str | None:
+    """Start cloudflared and keep it alive. Returns the public URL or None."""
+    global _tunnel_proc
     cloudflared = shutil.which("cloudflared")
     if not cloudflared:
         return None
 
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [cloudflared, "tunnel", "--url", f"http://127.0.0.1:{port}"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=config.server.tunnel_timeout,
         )
-        match = re.search(r"(https://[a-z0-9-]+\.trycloudflare\.com)", result.stderr)
-        return match.group(1) if match else None
-    except subprocess.TimeoutExpired:
+        deadline = time.time() + config.server.tunnel_timeout
+        while time.time() < deadline:
+            line = proc.stderr.readline()
+            if not line:
+                # Process died
+                break
+            m = re.search(r"(https://[a-zA-Z0-9-]+\.trycloudflare\.com)", line)
+            if m:
+                _tunnel_proc = proc  # Keep alive!
+                return m.group(1)
+        proc.kill()
         return None
     except Exception:
         return None

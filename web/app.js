@@ -135,21 +135,59 @@ async function startRecording() {
       echoCancellation: true,
       noiseSuppression: true,
       autoGainControl: true,
-      sampleRate: 48000,
+      sampleRate: { ideal: 48000 },
       channelCount: 1,
     },
   });
-  const recorder = new MediaRecorder(micStream, { mimeType: "audio/webm;codecs=opus" });
-  const chunks = [];
-  recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
-  recorder.onstop = async () => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const blob = new Blob(chunks, { type: "audio/webm;codecs=opus" });
-    const arrayBuffer = await blob.arrayBuffer();
-    ws.send(arrayBuffer);
+
+  // Use AudioContext to capture raw PCM16 instead of MediaRecorder (WebM/Opus)
+  // This avoids the format mismatch: phone now sends raw PCM16 at 48kHz mono,
+  // which the server expects after stripping the 1-byte header.
+  const rawCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+  const source = rawCtx.createMediaStreamSource(micStream);
+  const processor = rawCtx.createScriptProcessor(4096, 1, 1);
+
+  let sampleBuffer = [];
+
+  processor.onaudioprocess = (e) => {
+    if (!recording) return;
+    const input = e.inputBuffer.getChannelData(0);
+    // Float32 [-1,1] → Int16 PCM
+    const pcm16 = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i++) {
+      pcm16[i] = Math.max(-32768, Math.min(32767, input[i] * 32768));
+    }
+    sampleBuffer.push(pcm16);
   };
-  recorder.start(100);
-  stopRecording = () => { recorder.stop(); };
+
+  source.connect(processor);
+  processor.connect(rawCtx.destination); // Required for processing to work
+
+  stopRecording = () => {
+    recording = false;
+    source.disconnect();
+    processor.disconnect();
+    rawCtx.close();
+
+    // Concatenate all buffers and send as single ArrayBuffer
+    if (sampleBuffer.length > 0 && ws && ws.readyState === WebSocket.OPEN) {
+      const totalLen = sampleBuffer.reduce((sum, b) => sum + b.length, 0);
+      const combined = new Int16Array(totalLen);
+      let off = 0;
+      for (const buf of sampleBuffer) {
+        combined.set(buf, off);
+        off += buf.length;
+      }
+      // 1-byte format header (0x00 = PCM16) + raw PCM16 data
+      const frame = new Uint8Array(1 + combined.byteLength);
+      frame[0] = 0x00;
+      new Int16Array(frame.buffer, 1).set(combined);
+      ws.send(frame.buffer);
+    }
+    sampleBuffer = [];
+    micStream.getTracks().forEach((t) => t.stop());
+    micStream = null;
+  };
 }
 
 function stopRecordingNow() {
@@ -228,7 +266,7 @@ connectBtn.addEventListener("click", async () => {
             setOrbState(liveOrb, "idle");
             liveStatus.textContent = "Connected";
             haptic("medium");
-            await startRecording();
+            (async () => { await startRecording(); })();
           } else if (msg.type === "state" && msg.value) {
             setOrbState(liveOrb, msg.value);
             if (msg.value === "listening") liveStatus.textContent = "Listening…";
@@ -309,7 +347,7 @@ textInput.addEventListener("keydown", (e) => {
 
 sendBtn.addEventListener("click", sendText);
 
-bargeBtn.addEventListener("click", () => {
+bargeBtn.addEventListener("click", async () => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "barge_in" }));
     stopRecordingNow();
